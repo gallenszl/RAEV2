@@ -57,7 +57,20 @@ def main():
     #########################################################
     # Dataset and dataloader (unified)
     #########################################################
-    batch_size = config.training.global_batch_size // world_size if config.training.global_batch_size else config.training.batch_size
+    grad_accum_steps = max(1, int(config.training.grad_accum_steps))
+    global_batch_size = config.training.global_batch_size or (config.training.batch_size * world_size * grad_accum_steps)
+    denom = world_size * grad_accum_steps
+    if global_batch_size % denom != 0:
+        raise ValueError(
+            f"global_batch_size ({global_batch_size}) must be divisible by "
+            f"world_size * grad_accum_steps ({denom})."
+        )
+    batch_size = global_batch_size // denom
+    loader_virtual_steps = (
+        config.training.virtual_epoch_steps * grad_accum_steps
+        if config.training.virtual_epoch_steps is not None
+        else None
+    )
     dataloader_result = prepare_unified_dataloader(
         config=dataclasses.asdict(config.dataset),
         image_size=config.training.image_size,
@@ -66,12 +79,34 @@ def main():
         rank=rank,
         world_size=world_size,
         shuffle=True,
+        virtual_epoch_steps=loader_virtual_steps,
     )
     dataloader = dataloader_result.loader
 
-    steps_per_epoch = config.training.virtual_epoch_steps if config.training.virtual_epoch_steps else len(dataloader_result)
+    if config.training.virtual_epoch_steps is not None:
+        steps_per_epoch = config.training.virtual_epoch_steps
+    else:
+        steps_per_epoch = len(dataloader_result) // grad_accum_steps
     if steps_per_epoch == 0:
-        raise RuntimeError("Dataloader returned zero batches.")
+        raise RuntimeError("Dataloader returned zero optimizer steps.")
+    if rank == 0:
+        logger.info(
+            f"Batch setup: global_batch_size={global_batch_size}, "
+            f"world_size={world_size}, micro_batch_size={batch_size}, "
+            f"grad_accum_steps={grad_accum_steps}, steps_per_epoch={steps_per_epoch}"
+        )
+        if args.wandb:
+            import wandb
+            wandb.config.update({
+                "config": dataclasses.asdict(config),
+                "batch/global_batch_size": global_batch_size,
+                "batch/world_size": world_size,
+                "batch/micro_batch_size": batch_size,
+                "batch/grad_accum_steps": grad_accum_steps,
+                "train/steps_per_epoch": steps_per_epoch,
+                "paths/experiment_dir": experiment_dir,
+                "paths/checkpoint_dir": checkpoint_dir,
+            }, allow_val_change=True)
 
     # Eval datasets (unified format)
     eval_datasets = None

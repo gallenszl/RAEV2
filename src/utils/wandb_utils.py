@@ -70,11 +70,10 @@ def generate_run_id(exp_name):
 def initialize(args, entity, exp_name, project_name):
     config_dict = namespace_to_dict(args)
     if is_main_process():
-        if "WANDB_KEY" in os.environ:
-            wandb.login(key=os.environ["WANDB_KEY"])
-        else:
-            # assert already logged in
-            pass
+        # Keep credentials ephemeral. Passing the key through WANDB_API_KEY lets
+        # wandb.init authenticate without writing a token to ~/.netrc.
+        if "WANDB_KEY" in os.environ and "WANDB_API_KEY" not in os.environ:
+            os.environ["WANDB_API_KEY"] = os.environ["WANDB_KEY"]
         wandb.init(
             entity=entity,
             project=project_name,

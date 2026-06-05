@@ -305,9 +305,9 @@ def create_dataloader(args, image_size, rank, world_size, is_distributed):
             transforms.ToTensor(),
         ])
     else:
-        # Raw images need resize + center crop
+        # Match Stage-1 ImageFolder eval/stat preprocessing for raw ImageNet.
         transform = transforms.Compose([
-            transforms.Resize(int(image_size * 1.15), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.Resize(int(image_size * 1.5), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(image_size),
             transforms.ToTensor(),
         ])

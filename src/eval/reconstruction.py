@@ -98,8 +98,11 @@ def evaluate_reconstruction_distributed(
                                   shared_tmpdir=shared_tmpdir, eval_type="reconstruction")
     loader = create_eval_dataloader(val_dataset, rank, world_size, num_samples, batch_size)
 
-    # Reconstruct images on this rank
+    # Reconstruct images on this rank. If no reference NPZ is provided,
+    # collect the input images as aligned references for PSNR/SSIM/LPIPS.
     reconstructions = []
+    references = []
+    needs_ref_shards = reference_npz_path is None
     iterator = tqdm(loader, desc=f"[Rank {rank}] Reconstructing", file=sys.stdout) if rank == 0 else loader
 
     with torch.inference_mode():
@@ -113,10 +116,18 @@ def evaluate_reconstruction_distributed(
 
             for img in recon_np:
                 reconstructions.append(img)
+            if needs_ref_shards:
+                ref_np = images.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+                for img in ref_np:
+                    references.append(img)
 
     reconstructions = np.stack(reconstructions)
     shard_path = os.path.join(temp_dir, f"recon_{global_step:07d}_{rank:02d}.npz")
     np.savez(shard_path, arr_0=reconstructions)
+    if needs_ref_shards:
+        references = np.stack(references)
+        ref_shard_path = os.path.join(temp_dir, f"ref_{global_step:07d}_{rank:02d}.npz")
+        np.savez(ref_shard_path, arr_0=references)
 
     if rank == 0:
         print(f"[Rank {rank}] Saved {len(reconstructions)} reconstructions to {shard_path}")
@@ -131,11 +142,17 @@ def evaluate_reconstruction_distributed(
         print(f"[Eval] Combined reconstruction NPZ shape: {combined_recons.shape}")
 
         ref_npz_path = reference_npz_path
-        if not os.path.exists(ref_npz_path):
-            raise FileNotFoundError(f"Reference NPZ not found at {ref_npz_path}")
+        if isinstance(ref_npz_path, list):
+            ref_npz_path = ref_npz_path[0] if ref_npz_path else None
 
-        ref_images = np.load(ref_npz_path)["arr_0"]
-        print(f"[Eval] Loaded reference NPZ from {ref_npz_path}, shape: {ref_images.shape}")
+        if ref_npz_path is not None:
+            if not os.path.exists(ref_npz_path):
+                raise FileNotFoundError(f"Reference NPZ not found at {ref_npz_path}")
+            ref_images = np.load(ref_npz_path)["arr_0"]
+            print(f"[Eval] Loaded reference NPZ from {ref_npz_path}, shape: {ref_images.shape}")
+        else:
+            ref_images = gather_and_cleanup_shards(temp_dir, "ref", global_step, world_size, num_samples)
+            print(f"[Eval] Combined reference NPZ shape: {ref_images.shape}")
         if ref_images.shape[0] != combined_recons.shape[0]:
             print(f"[Eval] Aligning ref to recon size: {ref_images.shape[0]} -> {combined_recons.shape[0]}")
             ref_images = ref_images[: combined_recons.shape[0]]

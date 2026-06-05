@@ -65,6 +65,8 @@ class DatasetConfig:
     data_dir: str = "./data"
     split: Any = "train"
     condition_type: Optional[str] = None  # "label", "text", or "nwm"
+    resize_size: Optional[int] = None
+    prompt_template: str = "a photo of a {class_name}"
     shared_tmpdir: str = "~/tmp"
     # WDS-specific
     shuffle_buffer: int = 10000

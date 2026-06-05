@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from collections import defaultdict
 from typing import Dict, Optional
 
@@ -57,10 +58,19 @@ def train_one_epoch(
     ddp_model.train()
 
     disc = ddp_disc.module
+    disc_trainable_params = [
+        p for group in disc_optimizer.param_groups for p in group["params"]
+    ]
+    if not disc_trainable_params:
+        raise RuntimeError("Discriminator optimizer has no trainable parameters.")
     decoder = ddp_model.module.decoder
     last_layer = decoder.decoder_pred.weight
 
-    steps_per_epoch = config.training.virtual_epoch_steps if config.training.virtual_epoch_steps else len(dataloader)
+    grad_accum_steps = max(1, int(config.training.grad_accum_steps))
+    if config.training.virtual_epoch_steps:
+        steps_per_epoch = config.training.virtual_epoch_steps
+    else:
+        steps_per_epoch = len(dataloader) // grad_accum_steps
     disc_loss_fn, gen_loss_fn = select_gan_losses(config.gan.loss.disc_loss, config.gan.loss.gen_loss)
 
     gan_start_step = config.gan.loss.disc_start * steps_per_epoch
@@ -70,6 +80,8 @@ def train_one_epoch(
     do_eval = config.eval is not None and eval_datasets is not None
     epoch_metrics: Dict[str, torch.Tensor] = defaultdict(lambda: torch.zeros(1, device=device))
     num_batches = 0
+    num_updates = 0
+    last_disc_metrics: Dict[str, torch.Tensor] = {}
 
     # Checkpoint at epoch start
     if config.training.checkpoint_interval > 0 and epoch % config.training.checkpoint_interval == 0 and rank == 0:
@@ -86,10 +98,13 @@ def train_one_epoch(
     #########################################################
     # Train loop
     #########################################################
+    optimizer.zero_grad(set_to_none=True)
+    disc_optimizer.zero_grad(set_to_none=True)
     for images, _ in dataloader:
         use_gan = global_step >= gan_start_step and config.gan.loss.disc_weight > 0.0
         train_disc = global_step >= disc_update_step and config.gan.loss.disc_weight > 0.0
         use_lpips = global_step >= lpips_start_step and config.gan.loss.perceptual_weight > 0.0
+        is_accum_boundary = (num_batches + 1) % grad_accum_steps == 0
 
         images = images.to(device, non_blocking=True)
         real_normed = images * 2.0 - 1.0
@@ -97,8 +112,9 @@ def train_one_epoch(
         #########################################################
         # Train generator
         #########################################################
-        optimizer.zero_grad(set_to_none=True)
         disc.eval()
+        for param in disc_trainable_params:
+            param.requires_grad_(False)
 
         with autocast(**autocast_kwargs):
             recon = ddp_model(images)
@@ -121,14 +137,20 @@ def train_one_epoch(
             adaptive_weight = torch.zeros_like(recon_total)
             total_loss = recon_total
 
-        total_loss.backward()
-        if config.training.clip_grad:
-            torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), config.training.clip_grad)
-        optimizer.step()
+        backward_loss = total_loss / grad_accum_steps
+        sync_context = nullcontext() if is_accum_boundary else ddp_model.no_sync()
+        with sync_context:
+            backward_loss.backward()
 
-        if scheduler is not None:
-            scheduler.step()
-        update_ema(ema_model, ddp_model.module, config.training.ema_decay)
+        if is_accum_boundary:
+            if config.training.clip_grad:
+                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), config.training.clip_grad)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            if scheduler is not None:
+                scheduler.step()
+            update_ema(ema_model, ddp_model.module, config.training.ema_decay)
 
         #########################################################
         # Train discriminator
@@ -136,9 +158,10 @@ def train_one_epoch(
         disc_metrics: Dict[str, torch.Tensor] = {}
         if train_disc:
             ddp_model.eval()
+            for param in disc_trainable_params:
+                param.requires_grad_(True)
             ddp_disc.train()
             for _ in range(config.gan.loss.disc_updates):
-                disc_optimizer.zero_grad(set_to_none=True)
                 with autocast(**autocast_kwargs):
                     with torch.no_grad():
                         recon_disc = ddp_model(images)
@@ -151,8 +174,14 @@ def train_one_epoch(
                     d_loss = disc_loss_fn(logits_real, logits_fake)
                     accuracy = (logits_real > logits_fake).float().mean()
 
-                d_loss.backward()
-                disc_optimizer.step()
+                disc_backward_loss = d_loss / grad_accum_steps
+                disc_sync_context = nullcontext() if is_accum_boundary else ddp_disc.no_sync()
+                with disc_sync_context:
+                    disc_backward_loss.backward()
+
+                if is_accum_boundary:
+                    disc_optimizer.step()
+                    disc_optimizer.zero_grad(set_to_none=True)
 
                 disc_metrics = {
                     "disc_loss": d_loss.detach(),
@@ -162,10 +191,13 @@ def train_one_epoch(
                 }
                 epoch_metrics["disc_loss"] += d_loss.detach()
                 epoch_metrics["disc_accuracy"] += accuracy.detach()
-                if disc_scheduler is not None:
+                if is_accum_boundary and disc_scheduler is not None:
                     disc_scheduler.step()
+                last_disc_metrics = disc_metrics
 
             ddp_disc.eval()
+            for param in disc_trainable_params:
+                param.requires_grad_(False)
             ddp_model.train()
 
         epoch_metrics["recon"] += rec_loss.detach()
@@ -173,18 +205,31 @@ def train_one_epoch(
         epoch_metrics["gan"] += gan_loss.detach()
         epoch_metrics["total"] += total_loss.detach()
         num_batches += 1
+
+        if not is_accum_boundary:
+            continue
+
+        num_updates += 1
         progress_bar.update(1)
 
         #########################################################
         # Logging and visualization
         #########################################################
         if config.training.log_interval > 0 and global_step % config.training.log_interval == 0 and rank == 0:
+            max_memory_gb = (
+                torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                if device.type == "cuda"
+                else 0.0
+            )
             stats = {
                 "loss/total": total_loss.detach().item(),
                 "loss/recon": rec_loss.detach().item(),
                 "loss/lpips": lpips_loss.detach().item(),
                 "loss/gan": gan_loss.detach().item(),
                 "lr/generator": optimizer.param_groups[0]["lr"],
+                "train/micro_batch": batch_size,
+                "train/grad_accum_steps": grad_accum_steps,
+                "system/max_memory_allocated_gb": max_memory_gb,
             }
             if disc_metrics:
                 stats.update({
@@ -241,6 +286,8 @@ def train_one_epoch(
 
         # update global step
         global_step += 1
+        if num_updates >= steps_per_epoch:
+            break
 
     #########################################################
     # Epoch summary
@@ -252,11 +299,11 @@ def train_one_epoch(
             "epoch/loss_lpips": (epoch_metrics["lpips"] / num_batches).item(),
             "epoch/loss_gan": (epoch_metrics["gan"] / num_batches).item(),
         }
-        if disc_metrics:
+        if last_disc_metrics:
             epoch_stats.update({
                 "epoch/loss_disc": (epoch_metrics["disc_loss"] / num_batches).item(),
-                "epoch/disc_logits_real": disc_metrics["logits_real"].item(),
-                "epoch/disc_logits_fake": disc_metrics["logits_fake"].item(),
+                "epoch/disc_logits_real": last_disc_metrics["logits_real"].item(),
+                "epoch/disc_logits_fake": last_disc_metrics["logits_fake"].item(),
                 "epoch/disc_accuracy": (epoch_metrics["disc_accuracy"] / num_batches).item(),
             })
         logger.info(f"[Epoch {epoch}] " + ", ".join(f"{k}: {v:.4f}" for k, v in epoch_stats.items()))

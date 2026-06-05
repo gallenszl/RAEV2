@@ -16,17 +16,21 @@ Supports:
 """
 
 import argparse
+import dataclasses
 import logging
 import os
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
+from torchvision.utils import make_grid, save_image
 
 from configs.stage1 import Stage1Config
 from eval import evaluate_reconstruction_distributed
 from eval.datasets import normalize_eval_datasets, prepare_eval_datasets
 from stage1 import RAE
+from utils import wandb_utils
 from utils.logging import save_eval_to_csv
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import get_autocast_kwargs
@@ -95,22 +99,50 @@ def main(args):
     experiment_name = os.environ.get("EXPERIMENT_NAME")
     assert experiment_name is not None, "Please set the EXPERIMENT_NAME environment variable."
 
+    if args.wandb and rank == 0:
+        entity = os.environ["WANDB_ENTITY"]
+        project = os.environ["WANDB_PROJECT"]
+        wandb_utils.initialize(args, entity, experiment_name, project)
+        import wandb
+        wandb.config.update({
+            "config": dataclasses.asdict(config),
+            "eval/experiment_name": experiment_name,
+        }, allow_val_change=True)
+
     global_step = 0
 
     # ============================================================
     # Run evaluation for each dataset
     # ============================================================
     for ds_name, ds_info in eval_datasets.items():
+        eval_n = min(ds_info.num_samples or len(ds_info.dataset), len(ds_info.dataset))
         if rank == 0:
             logger.info(f"\n{'='*60}")
             logger.info(f"Evaluating on {ds_name}...")
-            logger.info(f"  Samples: {len(ds_info.dataset)}")
+            logger.info(f"  Samples: {eval_n} / {len(ds_info.dataset)}")
             logger.info(f"  Metrics: {ds_info.metrics}")
             logger.info(f"  Reference: {ds_info.reference_npz}")
             logger.info(f"{'='*60}")
 
+            num_viz = min(args.num_viz, eval_n)
+            if num_viz > 0:
+                images = torch.stack([ds_info.dataset[i][0] for i in range(num_viz)]).to(device)
+                with torch.inference_mode(), torch.cuda.amp.autocast(**autocast_kwargs):
+                    recon = rae(images).clamp(0, 1)
+                original_grid = make_grid(images.cpu().float(), nrow=8)
+                recon_grid = make_grid(recon.cpu().float(), nrow=8)
+                grid_dir = Path(eval_dir) / "grids"
+                grid_dir.mkdir(parents=True, exist_ok=True)
+                save_image(original_grid, grid_dir / f"{experiment_name}_{ds_name}_original.png")
+                save_image(recon_grid, grid_dir / f"{experiment_name}_{ds_name}_reconstructed.png")
+                if args.wandb:
+                    wandb_utils.log_images({
+                        f"eval/{ds_name}/original": original_grid,
+                        f"eval/{ds_name}/reconstructed": recon_grid,
+                    }, step=global_step)
+
         eval_stats = evaluate_reconstruction_distributed(
-            rae, ds_info.dataset, len(ds_info.dataset),
+            rae, ds_info.dataset, eval_n,
             rank=rank, world_size=world_size, device=device,
             batch_size=batch_size, experiment_dir=experiment_name,
             global_step=global_step, autocast_kwargs=autocast_kwargs,
@@ -120,11 +152,16 @@ def main(args):
         )
         if eval_stats is not None and rank == 0:
             save_eval_to_csv(experiment_name, f"ema_{ds_name}", global_step, eval_stats, eval_dir)
+            if args.wandb:
+                wandb_utils.log({f"eval/{k}_{ds_name}": v for k, v in eval_stats.items()}, step=global_step)
 
     dist.barrier()
     dist.destroy_process_group()
 
     if rank == 0:
+        if args.wandb:
+            import wandb
+            wandb.finish()
         logger.info("\nOffline Stage-1 evaluation complete.")
 
 
@@ -134,5 +171,7 @@ if __name__ == "__main__":
                         help="Path to the config file")
     parser.add_argument("--precision", type=str, choices=["fp32", "bf16"], default="bf16",
                         help="Compute precision")
+    parser.add_argument("--wandb", action="store_true", help="Use W&B for eval logging.")
+    parser.add_argument("--num-viz", type=int, default=64, help="Number of reconstructions to save/log.")
     args = parser.parse_args()
     main(args)

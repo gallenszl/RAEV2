@@ -9,8 +9,10 @@ import webdataset as wds
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
+from torchvision.datasets import ImageFolder
 
 from .imagenet_hf_dataset import ImageNetHFDataset
+from .imagenet_classes import IMAGENET_CLASSES
 
 T2I_HF_DATASETS = {'mscoco', 'mjhq', 'geneval', 'dpgbench', 'genaibench', 'simpleeval', 'sft_hack_datasets'}
 GENERIC_WDS_DATASETS = {'flux-synthetic-256', 'rendertext-256'}
@@ -138,6 +140,32 @@ def _prepare_arrow_eval_loader(
     )
 
 
+
+
+class _ImageNetImageFolderDataset(Dataset):
+    """ImageNet ImageFolder wrapper with label/text conditioning parity."""
+
+    def __init__(
+        self,
+        root: str,
+        transform: Optional[transforms.Compose] = None,
+        condition_type: str = "label",
+        prompt_template: str = "a photo of a {class_name}",
+    ):
+        self.dataset = ImageFolder(root=root, transform=transform)
+        self.condition_type = condition_type
+        self.prompt_template = prompt_template
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int):
+        image, label = self.dataset[idx]
+        if self.condition_type == "text":
+            class_name = IMAGENET_CLASSES[label]
+            return image, self.prompt_template.format(class_name=class_name)
+        return image, label
+
 class _T2IHFDataset(Dataset):
     """Internal HuggingFace dataset wrapper for MSCOCO/MJHQ T2I datasets."""
 
@@ -198,6 +226,7 @@ def prepare_unified_dataloader(
         )
 
     target = config.get("target", "imagenet")
+    condition_type = config.get("condition_type") or condition_type
 
     if target in T2I_HF_DATASETS:
         result = _prepare_t2i_hf_loader(
@@ -399,21 +428,44 @@ def _prepare_imagenet_loader(
     """Prepare ImageNet-style loader using existing dataset classes."""
     data_dir = config.get("data_dir", "./data/imagenet-256")
     split = config.get("split", "train")
+    dataset_type = config.get("type", "hf")
 
     # Build transform if not provided
     if transform is None:
-        transform = transforms.Compose([
-            transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.ToTensor(),
-        ])
+        if dataset_type == "imagefolder":
+            resize_size = config.get("resize_size", int(image_size * 1.5))
+            crop = (
+                transforms.RandomCrop(image_size)
+                if shuffle and split == "train"
+                else transforms.CenterCrop(image_size)
+            )
+            transform = transforms.Compose([
+                transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                crop,
+                transforms.ToTensor(),
+            ])
+        else:
+            transform = transforms.Compose([
+                transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.ToTensor(),
+            ])
 
-    # Create dataset based on type
-    dataset = ImageNetHFDataset(
-        data_dir=data_dir,
-        split=split,
-        transform=transform,
-        condition_type=condition_type,
-    )
+    if dataset_type == "hf":
+        dataset = ImageNetHFDataset(
+            data_dir=data_dir,
+            split=split,
+            transform=transform,
+            condition_type=condition_type,
+        )
+    elif dataset_type == "imagefolder":
+        dataset = _ImageNetImageFolderDataset(
+            root=str(Path(data_dir) / split),
+            transform=transform,
+            condition_type=condition_type,
+            prompt_template=config.get("prompt_template", "a photo of a {class_name}"),
+        )
+    else:
+        raise ValueError(f"Unsupported ImageNet dataset type: {dataset_type!r}")
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
     loader = DataLoader(

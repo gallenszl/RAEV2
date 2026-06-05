@@ -15,9 +15,51 @@ def _load_decoder(config_path, hidden_size, patch_size, num_patches, pretrained_
     if pretrained_path is not None:
         print(f"Loading pretrained decoder from {pretrained_path}")
         state_dict = torch.load(pretrained_path, map_location='cpu', weights_only=False)
-        keys = decoder.load_state_dict(state_dict, strict=False)
-        if keys.missing_keys:
-            print(f"Missing keys: {keys.missing_keys}")
+        current_state = decoder.state_dict()
+        compatible_state = {}
+        skipped_shape = []
+        unexpected = []
+        for key, value in state_dict.items():
+            if key not in current_state:
+                unexpected.append(key)
+                continue
+            if tuple(current_state[key].shape) != tuple(value.shape):
+                skipped_shape.append(key)
+                continue
+            compatible_state[key] = value
+
+        allowed_skips = {"decoder_pos_embed"}
+        bad_skips = sorted(set(skipped_shape) - allowed_skips)
+        if unexpected:
+            raise RuntimeError(
+                "Unexpected keys in pretrained decoder checkpoint: "
+                + ", ".join(sorted(unexpected))
+            )
+        if bad_skips:
+            raise RuntimeError(
+                "Unexpected shape mismatches when loading pretrained decoder: "
+                + ", ".join(bad_skips)
+            )
+
+        keys = decoder.load_state_dict(compatible_state, strict=False)
+        missing = set(keys.missing_keys)
+        bad_missing = sorted(missing - allowed_skips)
+        if keys.unexpected_keys:
+            raise RuntimeError(
+                "Unexpected keys after filtered decoder load: "
+                + ", ".join(sorted(keys.unexpected_keys))
+            )
+        if bad_missing:
+            raise RuntimeError(
+                "Missing decoder keys after warm-start: "
+                + ", ".join(bad_missing)
+            )
+        if skipped_shape:
+            print(f"Skipped shape-mismatched decoder keys: {sorted(skipped_shape)}")
+        print(
+            f"Loaded {len(compatible_state)}/{len(current_state)} decoder tensors "
+            f"from {pretrained_path}"
+        )
     return decoder
 
 def _load_normalization_stats(path):
