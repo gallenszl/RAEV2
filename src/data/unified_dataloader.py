@@ -1,12 +1,15 @@
 """Unified dataloader interface for RAEv2 training."""
+import os
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
 import webdataset as wds
-from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
@@ -33,6 +36,7 @@ class DataloaderResult:
     _batch_size: int = 1
     _num_workers: int = 4
     _world_size: int = 1
+    _dataset: Optional[Dataset] = field(default=None, repr=False)
     virtual_epoch_steps: Optional[int] = None
 
     def set_epoch(self, epoch: int):
@@ -41,6 +45,11 @@ class DataloaderResult:
         For map-style: calls sampler.set_epoch()
         For WebDataset: recreates pipeline with new seed (uses virtual_epoch_steps if set)
         """
+        dataset = self._dataset
+        if dataset is None and hasattr(self.loader, "dataset"):
+            dataset = self.loader.dataset
+        if dataset is not None and hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
         if self.sampler is not None:
             self.sampler.set_epoch(epoch)
         elif self._wds_pipeline is not None:
@@ -166,6 +175,126 @@ class _ImageNetImageFolderDataset(Dataset):
             return image, self.prompt_template.format(class_name=class_name)
         return image, label
 
+
+_FLUFFY_SHARD_RE = re.compile(r"^\d{3}-\d{3}$")
+_FLUFFY_RGB_RE = re.compile(r"^\d{3}\.png$")
+_DEFAULT_FLUFFY_VIEWS = [f"{i:03d}.png" for i in range(25)]
+
+
+class _FluffyElephantDataset(Dataset):
+    """Dynamic-view FluffyElephant dataset.
+
+    Expected layout: root/000-000/<sample_id>/000.png ... 024.png.
+    Depth images and metadata are excluded by the strict RGB filename regex.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        transform: Optional[transforms.Compose] = None,
+        views_per_sample: int = 5,
+        seed: int = 20260605,
+        expected_samples: Optional[int] = None,
+        filename_regex: str = r"^\d{3}\.png$",
+        view_names: Optional[List[str]] = None,
+        validate_views: bool = True,
+        drop_bad_samples: bool = False,
+    ):
+        self.root = Path(root)
+        self.transform = transform
+        self.views_per_sample = int(views_per_sample)
+        self.seed = int(seed)
+        self.rgb_re = re.compile(filename_regex)
+        self.validate_views = bool(validate_views)
+        self.drop_bad_samples = bool(drop_bad_samples)
+        self.bad_samples: List[Tuple[str, int]] = []
+        candidate_views = view_names or _DEFAULT_FLUFFY_VIEWS
+        self.candidate_views = [name for name in candidate_views if self.rgb_re.match(name)]
+
+        if self.views_per_sample < 1:
+            raise ValueError("views_per_sample must be >= 1")
+        if len(self.candidate_views) < self.views_per_sample:
+            raise ValueError(
+                f"Only {len(self.candidate_views)} candidate RGB views match {filename_regex!r}; "
+                f"need at least {self.views_per_sample}"
+            )
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"FluffyElephant root not found: {self.root}")
+
+        self.samples: List[Tuple[str, List[str]]] = []
+        bad_samples: List[Tuple[str, int]] = []
+        shard_dirs = sorted(
+            entry.path for entry in os.scandir(self.root)
+            if entry.is_dir() and _FLUFFY_SHARD_RE.match(entry.name)
+        )
+        if not shard_dirs:
+            raise FileNotFoundError(f"No 000-xxx shard directories found under {self.root}")
+
+        for shard in shard_dirs:
+            sample_dirs = sorted(entry.path for entry in os.scandir(shard) if entry.is_dir())
+            for sample_dir in sample_dirs:
+                if self.validate_views:
+                    views = [
+                        name for name in self.candidate_views
+                        if os.path.isfile(os.path.join(sample_dir, name))
+                    ]
+                else:
+                    views = list(self.candidate_views)
+                if len(views) < self.views_per_sample:
+                    bad_samples.append((sample_dir, len(views)))
+                    continue
+                self.samples.append((sample_dir, views))
+
+        if bad_samples:
+            self.bad_samples = bad_samples
+            if not self.drop_bad_samples:
+                preview = ", ".join(f"{path} ({count})" for path, count in bad_samples[:20])
+                raise ValueError(
+                    f"{len(bad_samples)} FluffyElephant samples have fewer than "
+                    f"{self.views_per_sample} RGB views. First bad samples: {preview}"
+                )
+
+        if expected_samples is not None and len(self.samples) != int(expected_samples):
+            raise ValueError(
+                f"Expected {expected_samples} FluffyElephant samples, found {len(self.samples)}"
+            )
+
+        self._epoch = -1
+        self._selected: List[Tuple[int, str]] = []
+        self.set_epoch(0)
+
+    def __len__(self) -> int:
+        return len(self.samples) * self.views_per_sample
+
+    def set_epoch(self, epoch: int) -> None:
+        epoch = int(epoch)
+        if epoch == self._epoch and self._selected:
+            return
+        rng = random.Random(self.seed + epoch)
+        selected: List[Tuple[int, str]] = []
+        for sample_idx, (_, views) in enumerate(self.samples):
+            for view_name in rng.sample(views, self.views_per_sample):
+                selected.append((sample_idx, view_name))
+        self._selected = selected
+        self._epoch = epoch
+
+    def __getitem__(self, idx: int):
+        sample_idx, view_name = self._selected[idx]
+        sample_dir, _ = self.samples[sample_idx]
+        image = Image.open(os.path.join(sample_dir, view_name)).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, -1
+
+
+class _EpochAwareConcatDataset(ConcatDataset):
+    """ConcatDataset that forwards set_epoch to dynamic child datasets."""
+
+    def set_epoch(self, epoch: int) -> None:
+        for dataset in self.datasets:
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(epoch)
+
 class _T2IHFDataset(Dataset):
     """Internal HuggingFace dataset wrapper for MSCOCO/MJHQ T2I datasets."""
 
@@ -218,6 +347,12 @@ def prepare_unified_dataloader(
     Unified dataloader factory for ImageNet, BLIP3O, MSCOCO, MJHQ, NWM,
     rendertext-256, flux-synthetic-256, and multi-source `mix:` configs.
     """
+    if config.get("concat") or config.get("sources"):
+        return _prepare_concat_loader(
+            config, image_size, batch_size, num_workers, rank, world_size,
+            transform, condition_type, shuffle, virtual_epoch_steps,
+        )
+
     # Multi-source mix: dataset.mix = [{target: ..., weight: ..., ...}, ...]
     if config.get("mix"):
         return _prepare_mixed_loader(
@@ -248,6 +383,10 @@ def prepare_unified_dataloader(
         result = _prepare_imagenet_loader(
             config, image_size, batch_size, num_workers, rank, world_size, transform, condition_type, shuffle
         )
+    elif target == "fluffyelephant":
+        result = _prepare_fluffy_elephant_loader(
+            config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
+        )
     elif target == "nwm":
         result = _prepare_nwm_loader(
             config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
@@ -257,6 +396,169 @@ def prepare_unified_dataloader(
     result.virtual_epoch_steps = virtual_epoch_steps
     return result
 
+
+
+def _build_imagefolder_transform(config: dict, image_size: int, shuffle: bool, split: str = "train"):
+    resize_size = config.get("resize_size", int(image_size * 1.5))
+    crop = (
+        transforms.RandomCrop(image_size)
+        if shuffle and split == "train"
+        else transforms.CenterCrop(image_size)
+    )
+    return transforms.Compose([
+        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        crop,
+        transforms.ToTensor(),
+    ])
+
+
+def _build_imagenet_map_dataset(
+    config: dict,
+    image_size: int,
+    transform: Optional[transforms.Compose],
+    condition_type: str,
+    shuffle: bool,
+) -> Dataset:
+    data_dir = config.get("data_dir", "./data/imagenet-256")
+    split = config.get("split", "train")
+    dataset_type = config.get("type", "hf")
+    if dataset_type == "hf":
+        if transform is None:
+            transform = transforms.Compose([
+                transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.ToTensor(),
+            ])
+        return ImageNetHFDataset(
+            data_dir=data_dir,
+            split=split,
+            transform=transform,
+            condition_type=condition_type,
+        )
+    if dataset_type == "imagefolder":
+        if transform is None:
+            transform = _build_imagefolder_transform(config, image_size, shuffle, split)
+        return _ImageNetImageFolderDataset(
+            root=str(Path(data_dir) / split),
+            transform=transform,
+            condition_type=condition_type,
+            prompt_template=config.get("prompt_template", "a photo of a {class_name}"),
+        )
+    raise ValueError(f"Unsupported ImageNet dataset type: {dataset_type!r}")
+
+
+def _build_fluffy_elephant_dataset(
+    config: dict,
+    image_size: int,
+    transform: Optional[transforms.Compose],
+    shuffle: bool,
+) -> Dataset:
+    if transform is None:
+        transform = _build_imagefolder_transform(config, image_size, shuffle, split="train")
+    return _FluffyElephantDataset(
+        root=config.get("data_dir", "/scratch/zs3325/datasets/FluffyElephant"),
+        transform=transform,
+        views_per_sample=config.get("views_per_sample", 5),
+        seed=config.get("seed", 20260605),
+        expected_samples=config.get("expected_samples"),
+        filename_regex=config.get("filename_regex", r"^\d{3}\.png$"),
+        view_names=config.get("view_names"),
+        validate_views=config.get("validate_views", True),
+        drop_bad_samples=config.get("drop_bad_samples", False),
+    )
+
+
+def _build_map_dataset(
+    config: dict,
+    image_size: int,
+    transform: Optional[transforms.Compose],
+    condition_type: str,
+    shuffle: bool,
+) -> Dataset:
+    target = config.get("target", "imagenet")
+    child_condition_type = config.get("condition_type") or condition_type
+    if target == "imagenet":
+        return _build_imagenet_map_dataset(config, image_size, transform, child_condition_type, shuffle)
+    if target == "fluffyelephant":
+        return _build_fluffy_elephant_dataset(config, image_size, transform, shuffle)
+    raise ValueError(f"Target {target!r} is not supported in map-style concat datasets")
+
+
+def _prepare_concat_loader(
+    config: dict,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    rank: int,
+    world_size: int,
+    transform: Optional[transforms.Compose],
+    condition_type: str,
+    shuffle: bool,
+    virtual_epoch_steps: Optional[int],
+) -> DataloaderResult:
+    """Prepare a deterministic map-style concat loader."""
+    entries = config.get("concat") or config.get("sources")
+    if not entries:
+        raise ValueError("dataset.concat/sources must be a non-empty list")
+
+    datasets = [
+        _build_map_dataset(entry, image_size, transform, condition_type, shuffle)
+        for entry in entries
+    ]
+    dataset = _EpochAwareConcatDataset(datasets)
+    dataset.set_epoch(0)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=shuffle,
+        # Dynamic epoch-level sampling lives in the dataset object, so workers
+        # must be recreated after DataloaderResult.set_epoch(epoch).
+        persistent_workers=False,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
+    )
+
+    return DataloaderResult(
+        loader=loader,
+        sampler=sampler,
+        dataset_size=len(dataset),
+        is_iterable=False,
+        _dataset=dataset,
+        virtual_epoch_steps=virtual_epoch_steps,
+    )
+
+
+def _prepare_fluffy_elephant_loader(
+    config: dict,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    rank: int,
+    world_size: int,
+    transform: Optional[transforms.Compose],
+    shuffle: bool = True,
+) -> DataloaderResult:
+    dataset = _build_fluffy_elephant_dataset(config, image_size, transform, shuffle)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=shuffle,
+        persistent_workers=False,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
+    )
+    return DataloaderResult(
+        loader=loader,
+        sampler=sampler,
+        dataset_size=len(dataset),
+        is_iterable=False,
+        _dataset=dataset,
+    )
 
 def _prepare_generic_wds_loader(
     dataset_name: str,

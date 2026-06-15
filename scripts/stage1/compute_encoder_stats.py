@@ -51,7 +51,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from utils.model_utils import instantiate_from_config
-from data import ImageNetHFDataset
+from data import ImageNetHFDataset, prepare_unified_dataloader
 
 
 def parse_args():
@@ -101,6 +101,17 @@ def parse_args():
         type=Path,
         default=None,
         help="Path to ImageFolder dataset (alternative to HF dataset).",
+    )
+    parser.add_argument(
+        "--use-config-dataset",
+        action="store_true",
+        help="Use the top-level dataset config from --config instead of --data-path/--use-hf-dataset.",
+    )
+    parser.add_argument(
+        "--dataset-epoch",
+        type=int,
+        default=0,
+        help="Epoch seed for dynamic config datasets such as FluffyElephant.",
     )
 
     # Processing arguments
@@ -355,6 +366,51 @@ def create_dataloader(args, image_size, rank, world_size, is_distributed):
     return loader, len(dataset)
 
 
+def create_config_dataloader(config, args, rank, world_size, is_distributed):
+    """Create dataloader from the top-level training dataset config."""
+    dataset_cfg = config.get("dataset", None)
+    if dataset_cfg is None:
+        raise ValueError("--use-config-dataset requires config.dataset")
+    dataset_cfg = OmegaConf.to_container(dataset_cfg, resolve=True)
+    result = prepare_unified_dataloader(
+        config=dataset_cfg,
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        rank=rank,
+        world_size=world_size,
+        condition_type=dataset_cfg.get("condition_type", "label"),
+        shuffle=False,
+    )
+    result.set_epoch(args.dataset_epoch)
+    loader = result.loader
+    total_samples = result.dataset_size
+
+    if args.num_samples is not None and args.num_samples < total_samples:
+        dataset = torch.utils.data.Subset(loader.dataset, list(range(args.num_samples)))
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        ) if is_distributed else None
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=False,
+            multiprocessing_context="spawn" if args.num_workers > 0 else None,
+        )
+        total_samples = len(dataset)
+
+    return loader, total_samples
+
+
 def encode_batch(model, images, device):
     """
     Encode a batch of images to latents.
@@ -490,7 +546,10 @@ def main():
         print(f"\nLoading dataset...")
 
     # Create dataloader
-    loader, total_samples = create_dataloader(args, args.image_size, rank, world_size, is_distributed)
+    if args.use_config_dataset:
+        loader, total_samples = create_config_dataloader(config, args, rank, world_size, is_distributed)
+    else:
+        loader, total_samples = create_dataloader(args, args.image_size, rank, world_size, is_distributed)
 
     if rank == 0:
         print(f"Total samples: {total_samples}")

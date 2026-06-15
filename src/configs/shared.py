@@ -79,6 +79,9 @@ class DatasetConfig:
     # Multi-source mix: list of nested dataset configs each with a `weight`.
     # Entries are passed verbatim to prepare_unified_dataloader recursively.
     mix: Optional[List[Any]] = None
+    # Map-style concat sources; each entry is a nested dataset config.
+    concat: Optional[List[Any]] = None
+    sources: Optional[List[Any]] = None
 
 
 @dataclass
