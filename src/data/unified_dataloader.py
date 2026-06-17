@@ -16,10 +16,12 @@ from torchvision.datasets import ImageFolder
 
 from .imagenet_hf_dataset import ImageNetHFDataset
 from .imagenet_classes import IMAGENET_CLASSES
+from .multiview_dataset import ObjaverseMultiviewDataset, GSOMultiviewFixedDataset
 
 T2I_HF_DATASETS = {'mscoco', 'mjhq', 'geneval', 'dpgbench', 'genaibench', 'simpleeval', 'sft_hack_datasets'}
 GENERIC_WDS_DATASETS = {'flux-synthetic-256', 'rendertext-256'}
 ARROW_EVAL_TARGETS = {'arrow-eval'}  # generic map-style HF Arrow eval source; needs `data_dir` pointing at the Arrow dir
+MULTIVIEW_TARGETS = {'objaverse_multiview', 'gso_multiview_fixed'}
 
 
 @dataclass
@@ -387,6 +389,10 @@ def prepare_unified_dataloader(
         result = _prepare_fluffy_elephant_loader(
             config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
         )
+    elif target in MULTIVIEW_TARGETS:
+        result = _prepare_multiview_loader(
+            target, config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
+        )
     elif target == "nwm":
         result = _prepare_nwm_loader(
             config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
@@ -559,6 +565,62 @@ def _prepare_fluffy_elephant_loader(
         is_iterable=False,
         _dataset=dataset,
     )
+
+def _prepare_multiview_loader(
+    target: str,
+    config: dict,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    rank: int,
+    world_size: int,
+    transform: Optional[transforms.Compose],
+    shuffle: bool = True,
+) -> DataloaderResult:
+    if transform is not None:
+        raise ValueError("Custom transforms are not supported for multiview datasets; configure image_size instead.")
+
+    if target == "objaverse_multiview":
+        dataset = ObjaverseMultiviewDataset(
+            root=config.get("root", config.get("root_dir", config.get("data_dir", "/scratch/zs3325/datasets/FluffyElephant"))),
+            list_path=config.get("list_path", "/home/zs3325/code/RnG-fa3/data/objaverse_v1_in_lvis_25v.txt"),
+            image_size=image_size,
+            views_per_scene=config.get("views_per_scene", 4),
+            total_views=config.get("total_views", 25),
+            seed=config.get("seed", 20260616),
+        )
+    elif target == "gso_multiview_fixed":
+        dataset = GSOMultiviewFixedDataset(
+            root=config.get("root", config.get("root_dir", config.get("data_dir", "/scratch/zs3325/datasets/FluffyElephant/gso_render_rv"))),
+            split_file=config.get("split_file", config.get("list_path", "/home/zs3325/code/RnG-fa3/data/gso_subset64.txt")),
+            fixed_view_list_path=config.get("fixed_view_list_path"),
+            image_size=image_size,
+            views_per_scene=config.get("views_per_scene", 4),
+            total_views=config.get("total_views", 25),
+            seed=config.get("seed", 0),
+        )
+    else:
+        raise ValueError(f"Unsupported multiview target: {target!r}")
+
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=shuffle,
+        persistent_workers=False,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
+    )
+    return DataloaderResult(
+        loader=loader,
+        sampler=sampler,
+        dataset_size=len(dataset),
+        is_iterable=False,
+        _dataset=dataset,
+    )
+
 
 def _prepare_generic_wds_loader(
     dataset_name: str,

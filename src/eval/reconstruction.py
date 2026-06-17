@@ -15,6 +15,15 @@ from .fid import calculate_rfid
 from .distributed import setup_eval_tmpdir, create_eval_dataloader, gather_and_cleanup_shards
 
 
+def _flatten_image_batch(images: torch.Tensor) -> torch.Tensor:
+    if images.ndim == 5:
+        b, v, c, h, w = images.shape
+        return images.reshape(b * v, c, h, w)
+    if images.ndim == 4:
+        return images
+    raise ValueError(f"Expected 4D or 5D image batch, got shape {tuple(images.shape)}")
+
+
 def compute_reconstruction_metrics(
     ref_arr: np.ndarray,
     rec_arr: np.ndarray,
@@ -97,6 +106,8 @@ def evaluate_reconstruction_distributed(
     temp_dir = setup_eval_tmpdir(experiment_dir, global_step, rank,
                                   shared_tmpdir=shared_tmpdir, eval_type="reconstruction")
     loader = create_eval_dataloader(val_dataset, rank, world_size, num_samples, batch_size)
+    views_per_sample = int(getattr(val_dataset, "views_per_scene", 1))
+    metric_num_samples = num_samples * views_per_sample
 
     # Reconstruct images on this rank. If no reference NPZ is provided,
     # collect the input images as aligned references for PSNR/SSIM/LPIPS.
@@ -108,16 +119,19 @@ def evaluate_reconstruction_distributed(
     with torch.inference_mode():
         for images, _ in iterator:
             images = images.to(device, non_blocking=True)
+            target_images = _flatten_image_batch(images)
             with autocast(**autocast_kwargs):
                 recon = model(images)
 
             recon = recon.clamp(0, 1)
+            if recon.shape != target_images.shape:
+                raise RuntimeError(f"Reconstruction shape {tuple(recon.shape)} does not match target {tuple(target_images.shape)}")
             recon_np = recon.mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
             for img in recon_np:
                 reconstructions.append(img)
             if needs_ref_shards:
-                ref_np = images.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+                ref_np = target_images.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
                 for img in ref_np:
                     references.append(img)
 
@@ -138,7 +152,7 @@ def evaluate_reconstruction_distributed(
     # Rank 0 computes metrics
     metrics = None
     if rank == 0:
-        combined_recons = gather_and_cleanup_shards(temp_dir, "recon", global_step, world_size, num_samples)
+        combined_recons = gather_and_cleanup_shards(temp_dir, "recon", global_step, world_size, metric_num_samples)
         print(f"[Eval] Combined reconstruction NPZ shape: {combined_recons.shape}")
 
         ref_npz_path = reference_npz_path
@@ -151,7 +165,7 @@ def evaluate_reconstruction_distributed(
             ref_images = np.load(ref_npz_path)["arr_0"]
             print(f"[Eval] Loaded reference NPZ from {ref_npz_path}, shape: {ref_images.shape}")
         else:
-            ref_images = gather_and_cleanup_shards(temp_dir, "ref", global_step, world_size, num_samples)
+            ref_images = gather_and_cleanup_shards(temp_dir, "ref", global_step, world_size, metric_num_samples)
             print(f"[Eval] Combined reference NPZ shape: {ref_images.shape}")
         if ref_images.shape[0] != combined_recons.shape[0]:
             print(f"[Eval] Aligning ref to recon size: {ref_images.shape[0]} -> {combined_recons.shape[0]}")

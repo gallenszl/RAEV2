@@ -40,6 +40,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _flatten_image_batch(images: torch.Tensor) -> torch.Tensor:
+    if images.ndim == 5:
+        b, v, c, h, w = images.shape
+        return images.reshape(b * v, c, h, w)
+    if images.ndim == 4:
+        return images
+    raise ValueError(f"Expected 4D or 5D image batch, got shape {tuple(images.shape)}")
+
+
 def main(args):
     """Run offline reconstruction evaluation with distributed execution."""
     if not torch.cuda.is_available():
@@ -129,17 +138,27 @@ def main(args):
                 images = torch.stack([ds_info.dataset[i][0] for i in range(num_viz)]).to(device)
                 with torch.inference_mode(), torch.cuda.amp.autocast(**autocast_kwargs):
                     recon = rae(images).clamp(0, 1)
-                original_grid = make_grid(images.cpu().float(), nrow=8)
+                image_targets = _flatten_image_batch(images)
+                original_grid = make_grid(image_targets.cpu().float(), nrow=8)
                 recon_grid = make_grid(recon.cpu().float(), nrow=8)
+                paired_grid = None
+                if images.ndim == 5:
+                    paired = torch.stack([image_targets, recon], dim=1).reshape(-1, *image_targets.shape[1:])
+                    paired_grid = make_grid(paired.cpu().float(), nrow=images.shape[1] * 2)
                 grid_dir = Path(eval_dir) / "grids"
                 grid_dir.mkdir(parents=True, exist_ok=True)
                 save_image(original_grid, grid_dir / f"{experiment_name}_{ds_name}_original.png")
                 save_image(recon_grid, grid_dir / f"{experiment_name}_{ds_name}_reconstructed.png")
+                if paired_grid is not None:
+                    save_image(paired_grid, grid_dir / f"{experiment_name}_{ds_name}_paired.png")
                 if args.wandb:
-                    wandb_utils.log_images({
+                    images_to_log = {
                         f"eval/{ds_name}/original": original_grid,
                         f"eval/{ds_name}/reconstructed": recon_grid,
-                    }, step=global_step)
+                    }
+                    if paired_grid is not None:
+                        images_to_log[f"eval/{ds_name}/paired"] = paired_grid
+                    wandb_utils.log_images(images_to_log, step=global_step)
 
         eval_stats = evaluate_reconstruction_distributed(
             rae, ds_info.dataset, eval_n,

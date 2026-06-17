@@ -38,6 +38,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _configure_stage1_model(rae: torch.nn.Module, device: torch.device):
+    rae = rae.to(device)
+    if hasattr(rae, "configure_stage1_training"):
+        rae.configure_stage1_training()
+        ema_model = rae.make_ema_model().to(device).eval()
+        ema_model.requires_grad_(False)
+        trainable_params = list(rae.trainable_parameters())
+        return rae, ema_model, trainable_params
+
+    rae.encoder.eval()
+    rae.decoder.train()
+    ema_model = deepcopy(rae).to(device).eval()
+    ema_model.requires_grad_(False)
+    rae.encoder.requires_grad_(False)
+    rae.decoder.requires_grad_(True)
+    trainable_params = list(rae.decoder.parameters())
+    return rae, ema_model, trainable_params
+
+
 def main():
     args = parse_args()
 
@@ -125,13 +144,10 @@ def main():
     #########################################################
     # Model and DDP setup
     #########################################################
-    rae = instantiate_from_config(config.stage_1).to(device)
-    rae.encoder.eval()
-    rae.decoder.train()
-    ema_model = deepcopy(rae).to(device).eval()
-    ema_model.requires_grad_(False)
-    rae.encoder.requires_grad_(False)
-    rae.decoder.requires_grad_(True)
+    rae = instantiate_from_config(config.stage_1)
+    rae, ema_model, trainable_params = _configure_stage1_model(rae, device)
+    if not trainable_params:
+        raise RuntimeError("Stage-1 model has no trainable parameters.")
 
     ddp_model = DDP(rae, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False)
     if args.compile:
@@ -147,7 +163,7 @@ def main():
     #########################################################
     # Optimizer and scheduler
     #########################################################
-    optimizer, _ = build_optimizer(rae.decoder.parameters(), config.training.optimizer)
+    optimizer, _ = build_optimizer(trainable_params, config.training.optimizer)
     disc_params = [p for p in discriminator.parameters() if p.requires_grad]
     disc_optimizer, _ = build_optimizer(disc_params, config.gan.optimizer)
 

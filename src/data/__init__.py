@@ -3,6 +3,7 @@
 from .blip3o_wds_dataset import BLIP3O_METADATA, BLIP3OWebDataset
 from .imagenet_classes import IMAGENET_CLASSES
 from .imagenet_hf_dataset import ImageNetHFDataset
+from .multiview_dataset import ObjaverseMultiviewDataset, GSOMultiviewFixedDataset
 from .unified_dataloader import (
     DataloaderResult,
     MixedDataloader,
@@ -12,6 +13,8 @@ from .wds_image_dataset import GENERIC_WDS_METADATA, GenericWebDataset
 
 __all__ = [
     "ImageNetHFDataset",
+    "ObjaverseMultiviewDataset",
+    "GSOMultiviewFixedDataset",
     "IMAGENET_CLASSES",
     "prepare_unified_dataloader",
     "DataloaderResult",

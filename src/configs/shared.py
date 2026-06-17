@@ -82,6 +82,14 @@ class DatasetConfig:
     # Map-style concat sources; each entry is a nested dataset config.
     concat: Optional[List[Any]] = None
     sources: Optional[List[Any]] = None
+    # Scene-level multiview datasets.
+    root: Optional[str] = None
+    root_dir: Optional[str] = None
+    list_path: Optional[str] = None
+    split_file: Optional[str] = None
+    fixed_view_list_path: Optional[str] = None
+    views_per_scene: int = 4
+    total_views: int = 25
 
 
 @dataclass

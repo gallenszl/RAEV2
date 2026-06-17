@@ -20,6 +20,22 @@ from utils.sync_utils import sync_checkpoint_async, sync_evals_async
 from utils.train_utils import update_ema
 
 
+def _flatten_image_batch(images: torch.Tensor) -> torch.Tensor:
+    if images.ndim == 5:
+        b, v, c, h, w = images.shape
+        return images.reshape(b * v, c, h, w)
+    if images.ndim == 4:
+        return images
+    raise ValueError(f"Expected 4D or 5D image batch, got shape {tuple(images.shape)}")
+
+
+def _update_ema_model(ema_model, model, decay: float) -> None:
+    if hasattr(model, "update_ema_model"):
+        model.update_ema_model(ema_model, decay)
+    else:
+        update_ema(ema_model, model, decay)
+
+
 def train_one_epoch(
     ddp_model,
     ema_model,
@@ -107,7 +123,8 @@ def train_one_epoch(
         is_accum_boundary = (num_batches + 1) % grad_accum_steps == 0
 
         images = images.to(device, non_blocking=True)
-        real_normed = images * 2.0 - 1.0
+        target_images = _flatten_image_batch(images)
+        real_normed = target_images * 2.0 - 1.0
 
         #########################################################
         # Train generator
@@ -119,7 +136,9 @@ def train_one_epoch(
         with autocast(**autocast_kwargs):
             recon = ddp_model(images)
             recon_normed = recon * 2.0 - 1.0
-            rec_loss = (recon - images).abs().mean()
+            if recon.shape != target_images.shape:
+                raise RuntimeError(f"Reconstruction shape {tuple(recon.shape)} does not match target {tuple(target_images.shape)}")
+            rec_loss = (recon - target_images).abs().mean()
             lpips_loss = lpips_model(real_normed, recon_normed) if use_lpips else rec_loss.new_zeros(())
             recon_total = rec_loss + config.gan.loss.perceptual_weight * lpips_loss
 
@@ -150,7 +169,7 @@ def train_one_epoch(
 
             if scheduler is not None:
                 scheduler.step()
-            update_ema(ema_model, ddp_model.module, config.training.ema_decay)
+            _update_ema_model(ema_model, ddp_model.module, config.training.ema_decay)
 
         #########################################################
         # Train discriminator
@@ -249,8 +268,9 @@ def train_one_epoch(
         if global_step % config.training.sample_every == 0 and do_eval and viz_samples is not None:
             logger.info("Generating EMA samples...")
             with torch.no_grad():
-                samples = ema_model.decode(ema_model.encode(viz_samples))
-                original_grid = make_grid(viz_samples.cpu().float(), nrow=8)
+                samples = ema_model(viz_samples).clamp(0, 1)
+                viz_targets = _flatten_image_batch(viz_samples)
+                original_grid = make_grid(viz_targets.cpu().float(), nrow=8)
                 recon_grid = make_grid(samples.cpu().float(), nrow=8)
                 if args.wandb:
                     wandb_utils.log_images({"viz/original": original_grid, "viz/reconstructed": recon_grid}, step=global_step)
